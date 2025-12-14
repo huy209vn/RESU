@@ -7,7 +7,7 @@
 
 **RESU** is a novel sparse neural network training method that enables pruned weights to be resurrected through gradient-based competition. Unlike standard sparse training methods where pruned weights are permanently dead, RESU assigns learnable parameters to pruned coordinates, allowing them to compete for reactivation.
 
-> 📄 **Paper**: *RESU: Resurrection of Sparse Units* (NeurIPS 2025)
+> 📄 **Paper**: *RESU: Resurrection of Sparse Units* 
 
 ---
 
@@ -334,16 +334,15 @@ MIT License - see [LICENSE](LICENSE) file for details.
 ## 🙏 Acknowledgments
 
 - Built on PyTorch and Triton
-- Inspired by RigL, MEST, and Wanda
 - Special thanks to the sparse training research community
 
 ---
 
 ## 📧 Contact
 
-- **Issues**: [GitHub Issues](https://github.com/yourusername/resu/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/yourusername/resu/discussions)
-- **Email**: your.email@example.com
+- **Issues**: [GitHub Issues](https://github.com/huy209vn/resu/issues)
+- **Discussions**: [GitHub Discussions](https://github.com/huy209vn/resu/discussions)
+- **Email**: duchuytran12341@gmail.com
 
 ---
 
@@ -364,3 +363,8 @@ MIT License - see [LICENSE](LICENSE) file for details.
 ---
 
 **Made with ❤️ for advancing sparse neural network research**
+
+
+um
+yeah that was claude generated.
+actually...it's still in alpha...not yet SOTA...but we are getting there ok ..Lol
