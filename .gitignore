@@ -1,0 +1,11 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Rust
+target/
+
+# General
+.DS_Store
+*.log
