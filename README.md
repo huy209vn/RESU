@@ -39,7 +39,7 @@ RESU achieves state-of-the-art sparse training performance:
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/resu.git
+git clone https://github.com/huy209vn/resu.git
 cd resu
 
 # Install dependencies
@@ -365,6 +365,4 @@ MIT License - see [LICENSE](LICENSE) file for details.
 **Made with ❤️ for advancing sparse neural network research**
 
 
-um
-yeah that was claude generated.
-actually...it's still in alpha...not yet SOTA...but we are getting there ok ..Lol
+it's still in alpha...not yet SOTA...but we are getting there...memory overhead and throughput not so great..but accuracy is true.
