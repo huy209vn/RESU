@@ -13,8 +13,8 @@ long_description = readme_file.read_text() if readme_file.exists() else ""
 setup(
     name="resu",
     version="0.1.0",
-    author="Your Name",
-    author_email="your.email@example.com",
+    author="huy209vn",
+    author_email="duchuytran12341@gmail.com",
     description="Resurrection of Sparse Units: A novel sparse neural network training method",
     long_description=long_description,
     long_description_content_type="text/markdown",
