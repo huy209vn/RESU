@@ -146,13 +146,20 @@ class RESUConfig:
     
     use_amnesty: bool = True
     """Whether to use amnesty mechanism."""
-    
+
+    commit_strategy: Literal["amnesty", "wanda_reprune", "simple"] = "amnesty"
+    """Commit strategy after RESU phase:
+    - 'amnesty': Tournament between active and resurrected (original)
+    - 'wanda_reprune': Merge all θ → W, then re-prune with Wanda++/DSNoT
+    - 'simple': Just merge θ → W without re-pruning
+    """
+
     amnesty_r_start: float = 0.10
     """Initial resurrection budget."""
-    
+
     amnesty_r_end: float = 0.02
     """Final resurrection budget."""
-    
+
     amnesty_score_type: Literal["magnitude", "gradient", "wanda"] = "magnitude"
     """How to score weights for amnesty tournament."""
     

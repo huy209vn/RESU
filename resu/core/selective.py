@@ -205,18 +205,25 @@ def update_ema_and_consistency(
     """Fused EMA update and consistency computation."""
     if consistency_out is None:
         consistency_out = torch.empty_like(m)
-    
+
+    # CPU fallback
+    if not m.is_cuda:
+        m.mul_(beta).add_(g, alpha=(1.0 - beta))
+        v.mul_(beta).add_(g.abs(), alpha=(1.0 - beta))
+        consistency_out.copy_(m.abs() / (v + delta))
+        return consistency_out
+
     n = m.numel()
     BLOCK_SIZE = _get_block_size(n)
     grid = (triton.cdiv(n, BLOCK_SIZE),)
-    
+
     fused_ema_consistency_kernel[grid](
         m, v, g, consistency_out,
         beta, delta,
         n,
         BLOCK_SIZE=BLOCK_SIZE,
     )
-    
+
     return consistency_out
 
 
@@ -228,10 +235,16 @@ def selective_update(
     lr: float,
 ) -> None:
     """Apply selective update with consistency weighting."""
+    # CPU fallback
+    if not theta.is_cuda:
+        update = lr * selection * consistency * grad
+        theta.sub_(update)
+        return
+
     n = theta.numel()
     BLOCK_SIZE = _get_block_size(n)
     grid = (triton.cdiv(n, BLOCK_SIZE),)
-    
+
     selective_update_kernel[grid](
         theta, grad, selection, consistency,
         lr,

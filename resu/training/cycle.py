@@ -387,54 +387,83 @@ class RESUCycle:
         return PhaseResult(Phase.RESU, self.config.resu_steps, metrics, duration)
     
     def commit_phase(self) -> PhaseResult:
-        """Commit with amnesty tournament."""
-        self._log("COMMIT phase")
+        """Commit RESU and update mask based on strategy."""
+        self._log(f"COMMIT phase (strategy: {self.config.commit_strategy})")
         start_time = time.time()
-        
+
         total_resurrected = 0
         total_active_kept = 0
-        
+
         for name, module in self.resu_modules.items():
             if not module.is_resu_active:
                 continue
-            
+
             # Get effective weights and old mask
             W_eff = module.get_effective_weight()
             old_mask = module.mask
-            
-            if self.config.use_amnesty and old_mask is not None:
-                # Amnesty tournament
-                new_mask, result = self.amnesty.commit_with_amnesty(
-                    W_eff=W_eff,
-                    old_mask=old_mask,
-                    target_sparsity=self.target_sparsity,
-                    cycle=self.cycle_num,
-                )
-                
-                total_resurrected += result.n_resurrected_kept
-                total_active_kept += result.n_active_kept
-                
-                self._log(f"  {name}: {result.n_resurrected_kept} resurrected, "
-                         f"{result.n_active_kept} active kept")
-                
-                # Exit RESU and update mask
-                module.exit_resu_mode(commit=True)
-                module.set_mask(new_mask)
 
-                # Zero out newly pruned positions
-                with torch.no_grad():
-                    module.weight.data *= new_mask.mask
-            else:
-                # Simple commit without amnesty
+            # Choose commit strategy
+            if self.config.commit_strategy == "amnesty":
+                # Original amnesty tournament
+                if self.config.use_amnesty and old_mask is not None:
+                    new_mask, result = self.amnesty.commit_with_amnesty(
+                        W_eff=W_eff,
+                        old_mask=old_mask,
+                        target_sparsity=self.target_sparsity,
+                        cycle=self.cycle_num,
+                    )
+
+                    total_resurrected += result.n_resurrected_kept
+                    total_active_kept += result.n_active_kept
+
+                    self._log(f"  {name}: {result.n_resurrected_kept} resurrected, "
+                             f"{result.n_active_kept} active kept")
+
+                    # Exit RESU and update mask
+                    module.exit_resu_mode(commit=True)
+                    module.set_mask(new_mask)
+
+                    # Zero out newly pruned positions
+                    with torch.no_grad():
+                        module.weight.data *= new_mask.mask
+                else:
+                    # Simple commit without amnesty
+                    module.exit_resu_mode(commit=True)
+
+            elif self.config.commit_strategy == "wanda_reprune":
+                # RESU+Wanda strategy: Merge all θ → W, then re-prune with Wanda++
+                self._log(f"  {name}: Merging all resurrections, will re-prune with Wanda++")
+
+                # 1. Count pruned positions before merge
+                old_pruned = 0
+                if old_mask is not None:
+                    old_pruned = int((~old_mask.mask.bool()).sum().item())
+
+                # 2. Merge ALL θ into W (no tournament)
                 module.exit_resu_mode(commit=True)
+
+                # 3. Re-prune with Wanda++ (structure-aware)
+                # This will be done in the next cycle's prune phase
+                # After merge, W_eff has values at all positions
+                total_resurrected += old_pruned  # All pruned positions get values
+
+                self._log(f"  {name}: All {old_pruned} pruned positions merged")
+
+            elif self.config.commit_strategy == "simple":
+                # Just merge θ → W without re-pruning
+                self._log(f"  {name}: Simple merge without re-pruning")
+                module.exit_resu_mode(commit=True)
+
+            else:
+                raise ValueError(f"Unknown commit_strategy: {self.config.commit_strategy}")
         
         duration = time.time() - start_time
-        
+
         metrics = {
-            "total_resurrected": total_resurrected,
-            "total_active_kept": total_active_kept,
+            "total_resurrected": float(total_resurrected),
+            "total_active_kept": float(total_active_kept),
         }
-        
+
         return PhaseResult(Phase.COMMIT, 0, metrics, duration)
     
     # =========================================================================
