@@ -126,14 +126,117 @@ class WandaPlusPruner:
         """Convert scores to SparseMask (higher score = keep)."""
         flat = score.view(-1)
         k = int(sparsity * flat.numel())
-        
+
         if k > 0:
             threshold = torch.kthvalue(flat, k).values
             mask_tensor = (score > threshold).float()
         else:
             mask_tensor = torch.ones_like(score)
-        
+
         return SparseMask(mask_tensor)
+
+    def get_partial_structured_masks(
+        self,
+        sparsity: float,
+        n: int = 2,
+        m: int = 4,
+        dim: int = 1
+    ) -> Dict[int, Dict[str, SparseMask]]:
+        """Get PARTIAL N:M structured masks from Wanda++ scores (≤N per M).
+
+        This is the key for densification pipeline:
+        1. Wanda++ calibration → importance scores
+        2. This method → partial 2:4 structure (~70% sparse, ≤2 per 4)
+        3. RESU → fills underfilled groups to exactly 2:4
+        4. Result → perfect 2:4 at 50% sparsity!
+
+        For each group of M:
+        - Global pruning to target sparsity using Wanda scores
+        - Enforce ≤N per group (prune overfilled, keep underfilled)
+        - Result: (0,0,0,0), (x,0,0,0), (x,x,0,0) groups
+
+        Args:
+            sparsity: Target overall sparsity (e.g., 0.7 for 70% sparse)
+            n: Max number to keep per group (default 2)
+            m: Group size (default 4)
+            dim: Dimension to apply pattern (0=rows, 1=columns)
+
+        Returns:
+            Dict[layer_idx, Dict[name, SparseMask]]
+
+        Example:
+            >>> pruner.calibrate()
+            >>> masks = pruner.get_partial_structured_masks(sparsity=0.7, n=2, m=4)
+            >>> pruner.apply_masks(masks)
+            >>> # Now: 70% sparse, ≤2 per 4, ready for RESU!
+        """
+        from ..core.structured import score_to_partial_nm_structured
+
+        if not self._calibrated:
+            raise RuntimeError("Must calibrate first")
+
+        masks = {}
+
+        for layer_idx, layer_stats in self._wanda_stats.items():
+            masks[layer_idx] = {}
+            for name, stats in layer_stats.items():
+                score = stats["score"]
+
+                # Convert scores to PARTIAL N:M structured mask
+                mask_tensor = score_to_partial_nm_structured(score, sparsity, n, m, dim)
+                masks[layer_idx][name] = SparseMask(mask_tensor)
+
+        return masks
+
+    def get_structured_masks(
+        self,
+        n: int = 2,
+        m: int = 4,
+        dim: int = 1
+    ) -> Dict[int, Dict[str, SparseMask]]:
+        """Get N:M structured masks from Wanda++ scores (EXACT N per M).
+
+        For each group of M weights along dimension dim:
+        - Keep top-N by Wanda score (not magnitude!)
+        - Zero the rest
+
+        This creates 2:4 (or other N:M) structured sparsity guided by
+        Wanda++ importance scores, which is smarter than magnitude-based.
+
+        NOTE: This enforces EXACTLY N per M. For partial structure (≤N per M),
+        use get_partial_structured_masks() instead.
+
+        Args:
+            n: Number to keep per group (default 2)
+            m: Group size (default 4)
+            dim: Dimension to apply pattern (0=rows, 1=columns)
+
+        Returns:
+            Dict[layer_idx, Dict[name, SparseMask]]
+
+        Example:
+            >>> pruner.calibrate()
+            >>> masks = pruner.get_structured_masks(n=2, m=4)
+            >>> pruner.apply_masks(masks)
+            >>> # Now model has EXACT 2:4 structured sparsity!
+        """
+        from ..core.structured import score_to_nm_structured
+
+        if not self._calibrated:
+            raise RuntimeError("Must calibrate first")
+
+        masks = {}
+
+        for layer_idx, layer_stats in self._wanda_stats.items():
+            masks[layer_idx] = {}
+            for name, stats in layer_stats.items():
+                score = stats["score"]
+
+                # Convert scores to N:M structured mask
+                mask_tensor = score_to_nm_structured(score, n, m, dim)
+                masks[layer_idx][name] = SparseMask(mask_tensor)
+
+        return masks
     
     def apply_masks(self, masks: Dict[int, Dict[str, SparseMask]]):
         """Apply masks to model weights.

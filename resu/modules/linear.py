@@ -19,7 +19,72 @@ import math
 from ..core.mask import SparseMask
 from ..core.resurrection import ResurrectionEmbedding, StorageMode
 from ..core.effective import effective_weight, effective_weight_dense
-from ..core.selective import RESUSelective, SelectionConfig
+from ..core.selective_simple import SimpleSelector, SimpleSelectionConfig, SelectionStrategy
+
+# Tensor core support for 2:4 structured sparsity
+try:
+    from torch.sparse import to_sparse_semi_structured
+    SEMI_STRUCTURED_AVAILABLE = True
+except ImportError:
+    SEMI_STRUCTURED_AVAILABLE = False
+    to_sparse_semi_structured = None
+
+
+class _SemiStructuredLinear(torch.autograd.Function):
+    """Custom autograd for semi-structured sparse linear with FP32 weights.
+
+    Forward: Convert FP32 → FP16 → sparse → matmul → FP32 (tensor core accelerated)
+    Backward: Standard dense gradient computation (gradients flow to FP32 weights)
+    """
+
+    @staticmethod
+    def forward(ctx, x, weight, bias):  # type: ignore[override]
+        # Save for backward
+        ctx.save_for_backward(x, weight, bias)
+
+        # Convert to FP16 for tensor cores
+        W_fp16 = weight.half()
+        x_fp16 = x.half()
+
+        # Convert to semi-structured sparse (guarded import at module level)
+        assert to_sparse_semi_structured is not None, "Semi-structured sparse not available"
+        W_sparse = to_sparse_semi_structured(W_fp16)
+
+        # Forward with tensor cores
+        out = F.linear(x_fp16, W_sparse, bias.half() if bias is not None else None)
+
+        # Return in original dtype
+        return out.to(x.dtype)
+
+    @staticmethod
+    def backward(ctx, grad_output):  # type: ignore[override]
+        x, weight, bias = ctx.saved_tensors
+
+        grad_x = grad_weight = grad_bias = None
+
+        if ctx.needs_input_grad[0]:
+            # Gradient w.r.t. input: grad_output @ weight
+            grad_x = grad_output @ weight
+
+        if ctx.needs_input_grad[1]:
+            # Gradient w.r.t. weight: grad_output.T @ x
+            # Reshape for matmul: grad_output is (..., out_features), x is (..., in_features)
+            grad_output_2d = grad_output.reshape(-1, grad_output.shape[-1])
+            x_2d = x.reshape(-1, x.shape[-1])
+            grad_weight = grad_output_2d.t() @ x_2d
+
+        if bias is not None and ctx.needs_input_grad[2]:
+            # Gradient w.r.t. bias: sum over batch dims
+            grad_bias = grad_output.reshape(-1, grad_output.shape[-1]).sum(0)
+
+        return grad_x, grad_weight, grad_bias
+
+
+# Legacy import for backward compatibility (deprecated)
+try:
+    from ..core.selective import SelectionConfig  # Deprecated, use SimpleSelectionConfig
+except ImportError:
+    SelectionConfig = SimpleSelectionConfig
 
 
 class RESUMode(Enum):
@@ -99,7 +164,7 @@ class RESULinear(nn.Module):
         self._mode = RESUMode.DENSE
         self._mask: Optional[SparseMask] = None
         self._resurrection: Optional[ResurrectionEmbedding] = None
-        self._selective: Optional[RESUSelective] = None
+        self._selective: Optional[Any] = None  # Deprecated, use simple selection
 
         # Performance optimization: cached active weights during RESU
         self._W_active_cached: Optional[torch.Tensor] = None
@@ -126,7 +191,13 @@ class RESULinear(nn.Module):
         self._capture_activations = False
         self._last_input: Optional[torch.Tensor] = None
         self._activation_norms: Optional[torch.Tensor] = None
-        
+
+        # Tensor core acceleration for 2:4 structured sparsity
+        self._use_tensor_cores = False
+        self._structured_n: Optional[int] = None
+        self._structured_m: Optional[int] = None
+        self._weight_sparse: Optional[torch.Tensor] = None  # Cached sparse representation
+
         # Initialize
         self.reset_parameters()
     
@@ -223,33 +294,7 @@ class RESULinear(nn.Module):
         # Zero out pruned weights
         with torch.no_grad():
             self.weight.data *= self._mask.mask
-    
-    def prune_by_wanda(self, sparsity: float, activation_norms: Optional[torch.Tensor] = None):
-        """Prune using Wanda (Weights and Activations).
-        
-        Score = |W| * ||X||
-        
-        Args:
-            sparsity: Fraction to prune
-            activation_norms: Input activation L2 norms (in_features,)
-                            Uses captured activations if None
-        """
-        if activation_norms is None:
-            activation_norms = self._activation_norms
-        
-        if activation_norms is None:
-            raise ValueError("No activation norms available. Enable capture or provide norms.")
-        
-        # Compute Wanda scores
-        scores = self.weight.data.abs() * activation_norms.unsqueeze(0)
-        
-        # Create mask from scores
-        mask = SparseMask.from_magnitude(scores, sparsity)
-        self.set_mask(mask)
-        
-        with torch.no_grad():
-            self.weight.data *= self._mask.mask
-    
+   
     def apply_mask(self):
         """Apply mask to weights (zero out pruned positions)."""
         if self._mask is not None:
@@ -265,20 +310,27 @@ class RESULinear(nn.Module):
         epsilon: float = 0.1,
         use_selective: bool = True,
         selective_config: Optional[SelectionConfig] = None,
+        selection_ratio: float = 0.2,
         lr: float = 1e-4,
         weight_decay: float = 0.0,
+        freeze_active: bool = True,
     ):
         """Enter RESU mode - enable resurrection parameter training.
 
         IN-PLACE STORAGE: θ is stored directly in W's pruned positions.
         This matches the paper's Proposition 2: "no additional memory required".
 
+        MEMORY-OPTIMIZED: Uses only int32 indices, NO dense masks stored.
+
         Args:
             epsilon: Initialization scale for θ
             use_selective: Use RESU-Selective filtering
-            selective_config: Configuration for selective updates
+            selective_config: Configuration for selective updates (deprecated, use selection_ratio instead)
+            selection_ratio: Fraction of pruned parameters to update (0.01 = 1%, 0.2 = 20%, etc.)
             lr: Learning rate for θ
             weight_decay: Weight decay for θ
+            freeze_active: If True, freeze active weights (only train θ).
+                          If False, train both active weights and θ.
         """
         if self._mask is None:
             raise RuntimeError("Cannot enter RESU mode without mask. Call set_mask() first.")
@@ -286,54 +338,194 @@ class RESULinear(nn.Module):
         if self._mode == RESUMode.RESU:
             return  # Already in RESU mode
 
-        # Compute active weight statistics for θ initialization
-        active_mask = self._mask.mask.bool()
-        pruned_mask = ~active_mask
-        active_weights = self.weight.data[active_mask]
+        # If indices were cleared (re-entering RESU), rebuild from weight sparsity
+        if len(self._mask._indices) == 0:
+            # Rebuild SparseMask from current weight pattern (0 = pruned)
+            pruned_indices = (self.weight.data == 0).flatten().nonzero(as_tuple=True)[0]
+            self._mask = SparseMask(pruned_indices, self.weight.shape, device=self.device)
+
+        # Get dense mask ONCE (triggers cache, then we clear it)
+        dense_mask = self._mask.mask.float()  # 1=active, 0=pruned
+        n_pruned = self._mask.n_pruned
+
+        # Compute active weight statistics
+        active_weights = self.weight.data[dense_mask.bool()]
         active_std = active_weights.std().item() if len(active_weights) > 0 else 1.0
 
         # CRITICAL: Store θ IN pruned positions of W (in-place)
-        # This is what the paper expects - no separate allocation!
+        pruned_mask = ~dense_mask.bool()
         with torch.no_grad():
-            # Initialize θ at pruned positions
-            n_pruned = int(pruned_mask.sum().item())
             theta_init = torch.randn(n_pruned, device=self.device, dtype=self.dtype)
             theta_init *= epsilon * active_std
             self.weight.data[pruned_mask] = theta_init
 
-        # Keep W trainable, but add gradient hook to mask active positions
+        # Keep W trainable
         self.weight.requires_grad_(True)
-
-        # Register hook to ONLY allow gradients on pruned positions
-        def grad_mask_hook(grad):
-            """Mask gradients: only pruned positions get updated."""
-            if grad is None:
-                return None
-            # Zero out gradients for active positions
-            return grad * (~active_mask).float()
 
         # Remove old hook if exists
         if hasattr(self, '_resu_grad_hook_handle'):
             self._resu_grad_hook_handle.remove()
+            delattr(self, '_resu_grad_hook_handle')
 
-        self._resu_grad_hook_handle = self.weight.register_hook(grad_mask_hook)
+        # Store config
+        self._freeze_active = freeze_active
+        self._use_selective = use_selective
 
-        # Setup selective updater if requested
-        # NOTE: Selective now operates on W[pruned_positions] directly
+        # BUILD GRADIENT MASK: Bool tensor, True = trainable, False = frozen
+        # Using bool instead of float32 saves 75% memory (1 byte vs 4 bytes)
         if use_selective:
-            # TODO: Refactor RESUSelective to work with in-place storage
-            # For now, selective is not supported with in-place mode
-            self._selective = None
-            print("Warning: RESU-Selective not yet supported with in-place storage")
-            # Ignore selective_config, lr, weight_decay for now
+            ratio = selection_ratio
+            if selective_config is not None and hasattr(selective_config, 'k_select_ratio'):
+                ratio = selective_config.k_select_ratio
+
+            k_select = max(1, int(n_pruned * ratio))
+
+            # Build selective mask: True at selected pruned positions only
+            self._grad_mask = torch.zeros(self.weight.numel(), dtype=torch.bool, device=self.device)
+            pruned_indices = self._mask.pruned_indices
+            perm = torch.randperm(n_pruned, device=self.device)[:k_select]
+            selected_indices = pruned_indices[perm]
+            self._grad_mask[selected_indices] = True
+            self._grad_mask = self._grad_mask.view(self.weight.shape)
+
+            self._selection_ratio = k_select / n_pruned
+            print(f"RESU-Selective: Selected {k_select}/{n_pruned} pruned positions ({self._selection_ratio:.1%})")
+
+        elif freeze_active:
+            # Train only pruned positions: grad_mask = True where pruned
+            self._grad_mask = ~dense_mask.bool()
+
         else:
-            self._selective = None
+            # Train everything (no mask needed)
+            self._grad_mask = None
+
+        # Clear SparseMask caches AND indices to reclaim memory
+        # We don't need _mask during RESU mode - _grad_mask contains all info
+        # Store essential stats before clearing
+        self._n_pruned = self._mask.n_pruned
+        self._n_active = self._mask.n_active
+        self._mask._mask_cache = None
+        self._mask._active_indices_cache = None
+        self._mask._pruned_indices_cache = None
+        # Clear indices (32 MB savings at 50% sparsity)
+        self._mask._indices = torch.tensor([], dtype=torch.int32, device=self.device)
+
+        # Register gradient hook - in-place masked_fill_ to avoid allocation!
+        if self._grad_mask is not None:
+            def grad_mask_hook(grad):
+                """Mask gradients in-place: zero where _grad_mask is False (frozen positions)."""
+                return grad.masked_fill_(~self._grad_mask, 0)  # In-place!
+
+            self._resu_grad_hook_handle = self.weight.register_hook(grad_mask_hook)
 
         # No separate resurrection object - θ lives in W!
         self._resurrection = None
+        self._selective = None
 
         self._mode = RESUMode.RESU
-    
+
+    def enter_resu_mode_structured(
+        self,
+        n: int = 2,
+        m: int = 4,
+        dim: int = 1,
+        epsilon: float = 0.1,
+    ):
+        """Enter RESU mode with EXACT N:M structure from the start.
+
+        Unlike regular RESU (trains all pruned positions), this:
+        1. Takes current partial N:M mask (≤N per M)
+        2. Computes ONLY which positions need θ to reach exactly N per M
+        3. Initializes θ in ONLY those fill positions
+        4. Result: EXACT N:M structure throughout training!
+
+        MEMORY-OPTIMIZED: Uses only int32 indices, NO dense masks stored.
+
+        Training uses dense ops (tensor cores need sparse-as-parameter, complex).
+        After training, call to_sparse_inference() for tensor core inference.
+
+        Args:
+            n: Number per group (default 2)
+            m: Group size (default 4)
+            dim: Dimension for N:M pattern
+            epsilon: Initialization scale for θ
+        """
+        from ..core.structured import compute_nm_fill_positions
+
+        if self._mask is None:
+            raise RuntimeError("Cannot enter RESU mode without mask. Call set_mask() first.")
+
+        if self._mode == RESUMode.RESU:
+            return
+
+        # Get current mask as float tensor (temporary, not stored)
+        current_mask = self._mask.mask.float()
+
+        # Compute which positions need θ to reach exact N:M (returns dense masks)
+        theta_mask_dense, final_mask_dense = compute_nm_fill_positions(current_mask, n, m, dim)
+
+        n_theta = int(theta_mask_dense.sum().item())
+
+        # Statistics
+        n_active = self._mask.n_active
+        n_final = int(final_mask_dense.sum().item())
+        total = self.weight.numel()
+
+        print(f"RESU-Structured {n}:{m}:")
+        print(f"  Original active: {n_active} ({n_active/total*100:.1f}%)")
+        print(f"  θ positions to fill: {n_theta}")
+        print(f"  Final active (exact {n}:{m}): {n_final} ({n_final/total*100:.1f}%)")
+
+        # Initialize θ ONLY in fill positions
+        active_weights = self.weight.data[current_mask.bool()]
+        active_std = active_weights.std().item() if len(active_weights) > 0 else 1.0
+
+        theta_positions = theta_mask_dense.bool()
+        with torch.no_grad():
+            theta_init = torch.randn(n_theta, device=self.device, dtype=self.dtype)
+            theta_init *= epsilon * active_std
+            self.weight.data[theta_positions] = theta_init
+
+        # Update mask to exact N:M
+        pruned_indices = (~final_mask_dense.bool()).flatten().nonzero(as_tuple=True)[0]
+        self._mask = SparseMask(pruned_indices, final_mask_dense.shape, device=self.device)
+
+        # Store gradient mask as BOOL: True at θ positions (trainable), False elsewhere (frozen)
+        # Bool saves 75% memory vs float32 (1 byte vs 4 bytes)
+        self._grad_mask = theta_mask_dense.bool()
+
+        # Clear SparseMask caches AND indices to reclaim memory
+        # Store essential stats before clearing
+        self._n_pruned = self._mask.n_pruned
+        self._n_active = self._mask.n_active
+        self._mask._mask_cache = None
+        self._mask._active_indices_cache = None
+        self._mask._pruned_indices_cache = None
+        # Clear indices (32 MB savings at 50% sparsity)
+        self._mask._indices = torch.tensor([], dtype=torch.int32, device=self.device)
+
+        # Gradient hook: only update θ positions via in-place masked_fill_
+        if hasattr(self, '_resu_grad_hook_handle'):
+            self._resu_grad_hook_handle.remove()
+
+        def grad_mask_hook(grad):
+            """Only allow gradients at θ positions (in-place, zero allocations)."""
+            return grad.masked_fill_(~self._grad_mask, 0)
+
+        self._resu_grad_hook_handle = self.weight.register_hook(grad_mask_hook)
+
+        # Tensor cores disabled during training (need sparse-as-parameter for proper gradient flow)
+        # Use to_sparse_inference() after exit_resu_mode() for tensor core inference
+        self._use_tensor_cores = False
+        self._structured_n = n
+        self._structured_m = m
+        self._weight_sparse = None
+
+        self.weight.requires_grad_(True)
+        self._resurrection = None
+        self._selective = None
+        self._mode = RESUMode.RESU
+
     def exit_resu_mode(self, commit: bool = True):
         """Exit RESU mode.
 
@@ -351,20 +543,111 @@ class RESULinear(nn.Module):
             self._resu_grad_hook_handle.remove()
             delattr(self, '_resu_grad_hook_handle')
 
-        if not commit and self._mask is not None:
-            # If not committing, zero out pruned positions
+        if not commit:
+            # If not committing, zero out pruned positions (θ positions)
+            # Use _grad_mask if available (True = pruned), else fall back to _mask
             with torch.no_grad():
-                pruned_mask = ~self._mask.mask.bool()
-                self.weight.data[pruned_mask] = 0.0
+                if self._grad_mask is not None:
+                    self.weight.data[self._grad_mask] = 0.0
+                elif self._mask is not None:
+                    pruned_mask = ~self._mask.mask.bool()
+                    self.weight.data[pruned_mask] = 0.0
 
         # W already trainable, keep it that way
         self.weight.requires_grad_(True)
 
-        # No cleanup needed - no separate allocations!
+        # Clean up gradient mask to free memory
+        self._grad_mask = None
         self._resurrection = None
         self._selective = None
         self._mode = RESUMode.SPARSE
-    
+
+    def exit_resu_mode_structured(self, n: int = 2, m: int = 4, dim: int = 1):
+        """Exit RESU mode with EXACT N:M structured commit.
+
+        This is the final step of structured densification:
+        1. Wanda++ → partial 2:4 (≤N per M)
+        2. RESU → trains θ for pruned positions
+        3. THIS → commits to EXACT N:M by picking best N per M group
+
+        For each group of M:
+        - Candidates = {active weights} ∪ {trained θ}
+        - Keep top-N by magnitude
+        - Result: EXACTLY N:M structure!
+
+        Args:
+            n: Number to keep per group (default 2)
+            m: Group size (default 4)
+            dim: Dimension for N:M pattern (default 1 = columns)
+        """
+        from ..core.structured import commit_structured_nm
+
+        if self._mode != RESUMode.RESU:
+            return
+
+        # Remove gradient masking hook
+        if hasattr(self, '_resu_grad_hook_handle'):
+            self._resu_grad_hook_handle.remove()
+            delattr(self, '_resu_grad_hook_handle')
+
+        if self._mask is not None:
+            with torch.no_grad():
+                mask = self._mask.mask.float()
+
+                # In-place mode: W contains both active weights and θ
+                # Active weights are where mask=1, θ where mask=0
+                W_active = self.weight.data * mask
+                theta = self.weight.data * (1 - mask)
+
+                # Commit with structured constraint
+                W_committed, mask_new = commit_structured_nm(
+                    W_active, theta, mask, n, m, dim
+                )
+
+                # Update weight and mask
+                self.weight.data.copy_(W_committed)
+
+                # Convert mask tensor to SparseMask (need pruned indices)
+                pruned_indices = (~mask_new.bool()).flatten().nonzero(as_tuple=True)[0]
+                self._mask = SparseMask(
+                    pruned_indices,
+                    mask_new.shape,
+                    device=self.weight.device
+                )
+
+        # Restore standard training state
+        self.weight.requires_grad_(True)
+        self._resurrection = None
+        self._selective = None
+        self._mode = RESUMode.SPARSE
+
+    def to_sparse_inference(self) -> "RESULinear":
+        """Convert to sparse format for tensor core inference.
+
+        Call this AFTER exit_resu_mode() when weights are finalized.
+        Creates cached sparse representation for fast inference.
+
+        Returns:
+            self (for chaining)
+        """
+        if not SEMI_STRUCTURED_AVAILABLE:
+            print("Warning: Semi-structured sparse not available (need PyTorch 2.1+)")
+            return self
+
+        if self._mask is None:
+            print("Warning: No mask set, cannot convert to sparse")
+            return self
+
+        # Convert to FP16 sparse ONCE for inference
+        assert to_sparse_semi_structured is not None
+        with torch.no_grad():
+            W_fp16 = self.weight.data.half()
+            self._weight_sparse = to_sparse_semi_structured(W_fp16)
+            self._use_tensor_cores = True
+
+        print(f"Converted to 2:4 sparse for tensor core inference")
+        return self
+
     def resu_step(self, grad_matrix: torch.Tensor) -> Optional[dict]:
         """Perform one RESU update step.
 
@@ -479,93 +762,62 @@ class RESULinear(nn.Module):
         bits: int = 4,
         epsilon: float = 0.1,
         qscheme: Literal["per_channel", "per_tensor"] = "per_channel",
-        selective_config: Optional[SelectionConfig] = None,
+        selective_config: Optional[SimpleSelectionConfig] = None,
+        selection_ratio: float = 0.2,
         lr: float = 1e-4,
         weight_decay: float = 0.0,
     ):
-        """Enter QRESU-Selective mode - quantized W_A with selective filtering.
+        """Enter QRESU-Selective mode - quantized W_A with simple selective filtering.
 
-        OPTIMIZED STORAGE: θ stored as flat 1D tensor with EMA-based selective updates.
+        OPTIMIZED STORAGE: θ stored as flat 1D tensor with simple selection.
 
-        Selective filtering:
-        - Tracks gradient momentum (m) and magnitude (v) EMAs
-        - Computes consistency C = |m| / (v + δ)
-        - Only updates θ coordinates with high consistency + large gradients
+        Simple selective filtering (new approach):
+        - Select random subset of θ coordinates at phase start
+        - Only those coordinates receive gradient updates
+        - Zero per-step overhead (no EMA, no TopK)
 
         Args:
             bits: Quantization bit-width (4 or 8)
             epsilon: Initialization scale for θ
             qscheme: 'per_tensor' or 'per_channel'
-            selective_config: Configuration for selective updates
+            selective_config: Configuration for selective updates (deprecated)
+            selection_ratio: Fraction of θ to update (0.2 = 20%)
             lr: Learning rate for θ
             weight_decay: Weight decay for θ
         """
-        from ..core.selective import update_ema_and_consistency, select_coordinates, selective_update
-
         # First, enter regular QRESU mode (sets up θ, quantized W_A, etc.)
         self.enter_qresu_mode(bits=bits, epsilon=epsilon, qscheme=qscheme)
-
-        # Set up selective filtering state
-        self._selective_config = selective_config or SelectionConfig()
-        self._selective_lr = lr
 
         # Verify θ was created by enter_qresu_mode
         assert self._theta is not None, "θ should be initialized by enter_qresu_mode"
         n_pruned = self._theta.numel()
 
-        # Initialize EMA state (m, v, consistency)
-        self._ema_m = torch.zeros(n_pruned, device=self.device, dtype=self.dtype)
-        self._ema_v = torch.zeros(n_pruned, device=self.device, dtype=self.dtype)
-        self._consistency = torch.zeros(n_pruned, device=self.device, dtype=self.dtype)
-        self._selective_step_count = 0
+        # Simple selection: random subset at phase start (zero overhead!)
+        k_select = max(1, int(n_pruned * selection_ratio))
+        self._selected_theta_indices = torch.randperm(n_pruned, device=self.device)[:k_select]
+        self._selective_lr = lr
 
-        # Register gradient hook for selective updates
-        def selective_grad_hook(grad):
-            """Apply selective filtering to θ gradients."""
-            if (self._theta is None or self._theta.grad is None or
-                self._ema_m is None or self._ema_v is None or
-                self._consistency is None or self._selective_config is None):
+        print(f"QRESU-Selective: Selected {k_select}/{n_pruned} θ positions ({selection_ratio:.0%})")
+
+        # Register gradient hook for simple selective updates
+        def simple_selective_grad_hook(grad):
+            """Apply simple selective filtering to θ gradients."""
+            if self._theta is None or self._theta.grad is None:
                 return grad
 
-            # Get θ gradient
-            grad_theta = self._theta.grad
-
-            # Update EMAs and compute consistency
-            self._consistency = update_ema_and_consistency(
-                self._ema_m, self._ema_v, grad_theta,
-                self._selective_config.beta,
-                self._selective_config.delta,
-                self._consistency,
-            )
-
-            # Select coordinates for update
-            selection = select_coordinates(
-                grad_theta,
-                self._consistency,
-                self._selective_config,
-            )
-
-            # Apply selective update (modifies θ in-place)
-            if weight_decay > 0:
-                self._theta.data.mul_(1 - lr * weight_decay)
-
-            selective_update(
-                self._theta,
-                grad_theta,
-                selection.mask,
-                self._consistency,
-                lr,
-            )
-
-            # Zero out gradient (we already applied update)
-            self._theta.grad.zero_()
-
-            self._selective_step_count += 1
+            # Zero out non-selected gradients
+            mask = torch.zeros(self._theta.numel(), device=self.device)
+            mask[self._selected_theta_indices] = 1.0
+            self._theta.grad.mul_(mask)
 
             return grad
 
+        # Remove old hook if exists
+        if hasattr(self, '_grad_hook_handle') and self._grad_hook_handle is not None:
+            self._grad_hook_handle.remove()
+
         # Attach hook to θ
-        self._grad_hook_handle = self._theta.register_hook(selective_grad_hook)
+        self._grad_hook_handle = self._theta.register_hook(simple_selective_grad_hook)
 
         self._mode = RESUMode.QRESU_SELECTIVE
 
@@ -663,10 +915,16 @@ class RESULinear(nn.Module):
             return F.linear(x, W, self.bias)
 
         elif self._mode == RESUMode.SPARSE:
+            # Use tensor cores if converted to sparse (after to_sparse_inference())
+            if self._use_tensor_cores and self._weight_sparse is not None:
+                x_fp16 = x.half()
+                bias_fp16 = self.bias.half() if self.bias is not None else None
+                out = F.linear(x_fp16, self._weight_sparse, bias_fp16)
+                return out.to(x.dtype)
             # Use sparse matmul if sparsity exceeds threshold
             # Note: torch.sparse has overhead on GPU; tune sparse_threshold based on hardware
             # Typical values: 0.7-0.9 for CPU, 0.95+ for GPU
-            if use_sparse and self.sparsity > self.sparse_threshold:
+            elif use_sparse and self.sparsity > self.sparse_threshold:
                 return self._forward_sparse(x)
             else:
                 # Dense matmul with masked weights (usually faster on GPU)
@@ -678,8 +936,18 @@ class RESULinear(nn.Module):
             # W now contains:
             #   - Active weights at active positions (frozen via grad hook)
             #   - θ values at pruned positions (trainable via grad hook)
-            # No scatter, no materialization, no overhead. Just works.
-            return F.linear(x, self.weight, self.bias)
+
+            # Use tensor cores for 2:4 structured sparsity if enabled
+            if self._use_tensor_cores and self._weight_sparse is not None:
+                # Use cached sparse representation for tensor core forward
+                # Sync values from weight to sparse tensor (structure unchanged)
+                x_fp16 = x.half()
+                bias_fp16 = self.bias.half() if self.bias is not None else None
+                out = F.linear(x_fp16, self._weight_sparse, bias_fp16)
+                return out.to(x.dtype)
+            else:
+                # Standard dense forward (no tensor core acceleration)
+                return F.linear(x, self.weight, self.bias)
 
         elif self._mode in [RESUMode.QRESU, RESUMode.QRESU_SELECTIVE]:
             # QRESU OPTIMIZED MODE:
@@ -831,8 +1099,9 @@ class RESULinear(nn.Module):
             self._resurrection.load_state_dict(state['resurrection'])
         
         if 'selective' in state and self._resurrection is not None:
-            self._selective = RESUSelective(self._resurrection)
-            self._selective.load_state_dict(state['selective'])
+            # Deprecated: old RESUSelective state loading
+            # New simple selection doesn't need state (selection happens at phase start)
+            print("Warning: Ignoring old 'selective' state (deprecated). Using simple selection now.")
     
     # =========================================================================
     # Utilities
@@ -1014,8 +1283,9 @@ def _test_resu_linear():
     loss = y_resu.sum()
     loss.backward()
     
-    # Check that theta received gradients
-    assert layer.resurrection.theta.grad is not None or layer._selective is not None
+    # Check that weight gradients exist (θ is stored in-place in W)
+    # In-place mode: gradients flow to W, masked by _grad_mask
+    assert layer.weight.grad is not None, "Weight should have gradients"
     print("✓ RESU forward/backward works")
     
     # Test manual RESU step
@@ -1026,24 +1296,14 @@ def _test_resu_linear():
     print("✓ RESU step works")
     
     # Test commit
+    # With in-place θ storage, θ is already in W - commit just removes hook
     old_weight = layer.weight.data.clone()
     layer.exit_resu_mode(commit=True)
-    
+
     assert layer.mode == RESUMode.SPARSE
-    assert not torch.equal(old_weight, layer.weight.data), "Weights should change after commit"
-    print("✓ RESU commit works")
-    
-    # Test activation capture for Wanda
-    layer2 = RESULinear(in_features, out_features, device=device)
-    layer2.enable_activation_capture()
-    
-    _ = layer2(x)
-    assert layer2._activation_norms is not None
-    assert layer2._activation_norms.shape == (in_features,)
-    
-    layer2.prune_by_wanda(0.5)
-    assert abs(layer2.sparsity - 0.5) < 0.01
-    print("✓ Wanda pruning works")
+    # In-place mode: weights stay the same on commit (θ already in W)
+    assert torch.equal(old_weight, layer.weight.data), "Weights should stay same on commit (in-place mode)"
+    print("✓ RESU commit works (in-place mode)")
     
     # Test from_linear conversion
     linear = nn.Linear(256, 128, device=device)
@@ -1051,15 +1311,17 @@ def _test_resu_linear():
     assert torch.equal(resu_from.weight.data, linear.weight.data)
     print("✓ from_linear conversion works")
     
-    # Test state dict
-    layer.enter_resu_mode()
-    state = layer.state_dict_extended()
-    
+    # Test state dict - use fresh layer since committed layer has no sparsity
+    layer_fresh = RESULinear(in_features, out_features, device=device)
+    layer_fresh.prune_by_magnitude(0.5)
+    layer_fresh.enter_resu_mode()
+    state = layer_fresh.state_dict_extended()
+
     layer3 = RESULinear(in_features, out_features, device=device)
     layer3.load_state_dict_extended(state)
-    
-    assert layer3.mode == layer.mode
-    assert torch.allclose(layer3.weight.data, layer.weight.data)
+
+    assert layer3.mode == layer_fresh.mode
+    assert torch.allclose(layer3.weight.data, layer_fresh.weight.data)
     print("✓ State dict round-trip works")
     
     print("\n✓ All RESULinear tests passed!")

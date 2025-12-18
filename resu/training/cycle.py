@@ -334,6 +334,7 @@ class RESUCycle:
                     selective_config=selective_config,
                     lr=self.config.resu_lr,
                     weight_decay=self.config.weight_decay,
+                    freeze_active=self.config.freeze_active_during_resu,
                 )
         
         # RESU training loop
